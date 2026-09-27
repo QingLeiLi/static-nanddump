@@ -138,7 +138,7 @@ jobs:
           set -eux
 
           git clone \
-            https://git.infradead.org/mtd-utils.git \
+            https://github.com/sigma-star/mtd-utils.git \
             mtd-utils
 
           cd mtd-utils

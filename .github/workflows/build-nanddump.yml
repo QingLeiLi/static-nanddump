@@ -1,0 +1,182 @@
+name: Build static ARM64 nanddump
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TOOLCHAIN_URL: https://github.com/musl-cc/musl.cc/releases/download/v0.0.1/aarch64-linux-musl-cross.tgz
+  TOOLCHAIN_SHA256: c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            make \
+            file \
+            binutils \
+            wget
+
+      - name: Download AArch64 musl cross compiler
+        run: |
+          wget -O /tmp/aarch64-linux-musl-cross.tgz \
+            "${TOOLCHAIN_URL}"
+
+          echo "${TOOLCHAIN_SHA256}  /tmp/aarch64-linux-musl-cross.tgz" \
+            | sha256sum -c -
+
+          mkdir -p "$HOME/toolchains"
+
+          tar -xzf /tmp/aarch64-linux-musl-cross.tgz \
+            -C "$HOME/toolchains"
+
+          echo "$HOME/toolchains/aarch64-linux-musl-cross/bin" \
+            >> "$GITHUB_PATH"
+
+      - name: Verify cross compiler
+        run: |
+          aarch64-linux-musl-gcc --version
+
+          cat >/tmp/test.c <<'EOF'
+          #include <stdio.h>
+          int main(void)
+          {
+              puts("ARM64 static test");
+              return 0;
+          }
+          EOF
+
+          aarch64-linux-musl-gcc \
+            -static \
+            -Os \
+            /tmp/test.c \
+            -o /tmp/test-arm64
+
+          file /tmp/test-arm64
+
+          file /tmp/test-arm64 | grep -q 'ARM aarch64'
+          file /tmp/test-arm64 | grep -q 'statically linked'
+
+      - name: Clone mtd-utils
+        run: |
+          git clone https://git.infradead.org/mtd-utils.git
+
+          cd mtd-utils
+
+          # Record exactly what was built.
+          git rev-parse HEAD | tee ../MTD_UTILS_COMMIT.txt
+          git log -1 --oneline
+
+      - name: Configure mtd-utils
+        run: |
+          cd mtd-utils
+
+          ./autogen.sh
+
+          CC=aarch64-linux-musl-gcc \
+          AR=aarch64-linux-musl-ar \
+          RANLIB=aarch64-linux-musl-ranlib \
+          STRIP=aarch64-linux-musl-strip \
+          CFLAGS="-Os" \
+          LDFLAGS="-static" \
+          ./configure \
+            --host=aarch64-linux-musl \
+            --without-tests \
+            --without-jffs \
+            --without-ubifs \
+            --without-lsmtd \
+            --disable-ubihealthd \
+            --without-zlib \
+            --without-lzo \
+            --without-zstd \
+            --without-selinux \
+            --without-crypto
+
+      - name: Build nanddump
+        run: |
+          cd mtd-utils
+
+          make -j"$(nproc)" nanddump
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifact
+
+          cp mtd-utils/nanddump \
+            artifact/nanddump-aarch64-static
+
+          chmod 755 artifact/nanddump-aarch64-static
+
+          cp MTD_UTILS_COMMIT.txt artifact/
+
+          sha256sum artifact/nanddump-aarch64-static \
+            > artifact/nanddump-aarch64-static.sha256
+
+      - name: Verify ARM64 static ELF
+        run: |
+          echo "===== file ====="
+          file artifact/nanddump-aarch64-static
+
+          echo
+          echo "===== ELF header ====="
+          readelf -h artifact/nanddump-aarch64-static
+
+          echo
+          echo "===== Program interpreter ====="
+
+          if readelf -l artifact/nanddump-aarch64-static \
+            | grep -q 'Requesting program interpreter'; then
+
+              echo "ERROR: dynamic ELF interpreter detected!"
+              exit 1
+          fi
+
+          echo "No ELF interpreter."
+
+          echo
+          echo "===== Dynamic section ====="
+
+          if readelf -d artifact/nanddump-aarch64-static \
+            2>&1 | grep -q '(NEEDED)'; then
+
+              echo "ERROR: shared-library dependency detected!"
+              readelf -d artifact/nanddump-aarch64-static
+              exit 1
+          fi
+
+          echo "No DT_NEEDED entries."
+
+          echo
+          echo "===== Final static check ====="
+
+          file artifact/nanddump-aarch64-static \
+            | grep -q 'ARM aarch64'
+
+          file artifact/nanddump-aarch64-static \
+            | grep -q 'statically linked'
+
+          echo "PASS: static AArch64 binary"
+
+      - name: Show checksum
+        run: |
+          cat artifact/nanddump-aarch64-static.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanddump-aarch64-static
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 90

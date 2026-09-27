@@ -12,12 +12,19 @@ env:
 
 jobs:
   build:
+    name: Build nanddump for AArch64
     runs-on: ubuntu-24.04
 
     steps:
+      # ------------------------------------------------------------
+      # 1. Install host-side tools
+      # ------------------------------------------------------------
       - name: Install host build tools
         run: |
+          set -eux
+
           sudo apt-get update
+
           sudo apt-get install -y \
             git \
             autoconf \
@@ -27,11 +34,22 @@ jobs:
             make \
             file \
             binutils \
-            wget
+            wget \
+            ca-certificates
 
+      # ------------------------------------------------------------
+      # 2. Download the AArch64 musl cross compiler
+      #
+      #    We use musl so the resulting nanddump can be completely
+      #    statically linked and does not depend on the target's
+      #    glibc/musl installation.
+      # ------------------------------------------------------------
       - name: Download AArch64 musl cross compiler
         run: |
-          wget -O /tmp/aarch64-linux-musl-cross.tgz \
+          set -eux
+
+          wget \
+            -O /tmp/aarch64-linux-musl-cross.tgz \
             "${TOOLCHAIN_URL}"
 
           echo "${TOOLCHAIN_SHA256}  /tmp/aarch64-linux-musl-cross.tgz" \
@@ -45,54 +63,125 @@ jobs:
           echo "$HOME/toolchains/aarch64-linux-musl-cross/bin" \
             >> "$GITHUB_PATH"
 
-      - name: Verify cross compiler
+      # ------------------------------------------------------------
+      # 3. Verify the cross compiler itself
+      #
+      #    Generate a minimal static non-PIE ARM64 Linux executable.
+      # ------------------------------------------------------------
+      - name: Verify AArch64 static toolchain
         run: |
+          set -eux
+
           aarch64-linux-musl-gcc --version
 
-          cat >/tmp/test.c <<'EOF'
+          cat > /tmp/test-static.c <<'EOF'
           #include <stdio.h>
+
           int main(void)
           {
-              puts("ARM64 static test");
+              puts("AArch64 static toolchain works");
               return 0;
           }
           EOF
 
           aarch64-linux-musl-gcc \
-            -static \
             -Os \
-            /tmp/test.c \
+            -static \
+            -no-pie \
+            -fno-PIE \
+            /tmp/test-static.c \
             -o /tmp/test-arm64
 
+          echo "===== file ====="
           file /tmp/test-arm64
 
-          file /tmp/test-arm64 | grep -q 'ARM aarch64'
-          file /tmp/test-arm64 | grep -q 'statically linked'
+          echo "===== ELF header ====="
+          readelf -h /tmp/test-arm64
 
+          echo "===== Program headers ====="
+          readelf -l /tmp/test-arm64
+
+          echo "===== Dynamic section ====="
+          readelf -d /tmp/test-arm64 || true
+
+          # Must be AArch64.
+          file /tmp/test-arm64 | grep -q "ARM aarch64"
+
+          # A truly self-contained executable must not request
+          # an ELF dynamic interpreter.
+          if readelf -l /tmp/test-arm64 \
+            | grep -q "Requesting program interpreter"; then
+
+              echo "ERROR: ELF interpreter detected"
+              exit 1
+          fi
+
+          # It must not contain any DT_NEEDED shared libraries.
+          if readelf -d /tmp/test-arm64 2>/dev/null \
+            | grep -q "(NEEDED)"; then
+
+              echo "ERROR: shared-library dependency detected"
+              readelf -d /tmp/test-arm64
+              exit 1
+          fi
+
+          echo "PASS: AArch64 self-contained static toolchain works"
+
+      # ------------------------------------------------------------
+      # 4. Clone upstream mtd-utils
+      #
+      #    Save the exact Git commit into the final artifact so the
+      #    build can be reproduced later.
+      # ------------------------------------------------------------
       - name: Clone mtd-utils
         run: |
-          git clone https://git.infradead.org/mtd-utils.git
+          set -eux
+
+          git clone \
+            https://git.infradead.org/mtd-utils.git \
+            mtd-utils
 
           cd mtd-utils
 
-          # Record exactly what was built.
-          git rev-parse HEAD | tee ../MTD_UTILS_COMMIT.txt
-          git log -1 --oneline
+          git rev-parse HEAD \
+            | tee ../MTD_UTILS_COMMIT.txt
 
-      - name: Configure mtd-utils
+          git log -1 --format=fuller \
+            | tee ../MTD_UTILS_GIT_INFO.txt
+
+      # ------------------------------------------------------------
+      # 5. Generate configure script
+      # ------------------------------------------------------------
+      - name: Generate mtd-utils build system
         run: |
+          set -eux
+
           cd mtd-utils
 
           ./autogen.sh
+
+      # ------------------------------------------------------------
+      # 6. Configure for static AArch64 Linux
+      #
+      #    Disable components that nanddump does not need. This keeps
+      #    external dependencies to a minimum.
+      # ------------------------------------------------------------
+      - name: Configure mtd-utils
+        run: |
+          set -eux
+
+          cd mtd-utils
 
           CC=aarch64-linux-musl-gcc \
           AR=aarch64-linux-musl-ar \
           RANLIB=aarch64-linux-musl-ranlib \
           STRIP=aarch64-linux-musl-strip \
-          CFLAGS="-Os" \
-          LDFLAGS="-static" \
+          CFLAGS="-Os -fno-PIE" \
+          LDFLAGS="-static -no-pie" \
           ./configure \
             --host=aarch64-linux-musl \
+            --disable-shared \
+            --enable-static \
             --without-tests \
             --without-jffs \
             --without-ubifs \
@@ -104,76 +193,191 @@ jobs:
             --without-selinux \
             --without-crypto
 
+      # ------------------------------------------------------------
+      # 7. Build only nanddump
+      # ------------------------------------------------------------
       - name: Build nanddump
         run: |
+          set -eux
+
           cd mtd-utils
 
           make -j"$(nproc)" nanddump
 
+          test -f nanddump
+
+      # ------------------------------------------------------------
+      # 8. Prepare final artifact
+      # ------------------------------------------------------------
       - name: Prepare artifact
         run: |
+          set -eux
+
           mkdir -p artifact
 
           cp mtd-utils/nanddump \
             artifact/nanddump-aarch64-static
 
-          chmod 755 artifact/nanddump-aarch64-static
+          chmod 755 \
+            artifact/nanddump-aarch64-static
 
-          cp MTD_UTILS_COMMIT.txt artifact/
+          cp MTD_UTILS_COMMIT.txt \
+            artifact/
 
-          sha256sum artifact/nanddump-aarch64-static \
+          cp MTD_UTILS_GIT_INFO.txt \
+            artifact/
+
+          sha256sum \
+            artifact/nanddump-aarch64-static \
             > artifact/nanddump-aarch64-static.sha256
 
-      - name: Verify ARM64 static ELF
+      # ------------------------------------------------------------
+      # 9. Strictly verify the final binary
+      #
+      #    Do not rely solely on the wording printed by `file`.
+      #
+      #    Requirements:
+      #      * ELF64
+      #      * AArch64
+      #      * no PT_INTERP
+      #      * no DT_NEEDED
+      # ------------------------------------------------------------
+      - name: Verify final nanddump ELF
         run: |
-          echo "===== file ====="
-          file artifact/nanddump-aarch64-static
+          set -eux
+
+          BIN="artifact/nanddump-aarch64-static"
 
           echo
-          echo "===== ELF header ====="
-          readelf -h artifact/nanddump-aarch64-static
+          echo "========================================"
+          echo "file"
+          echo "========================================"
+
+          file "$BIN"
 
           echo
-          echo "===== Program interpreter ====="
+          echo "========================================"
+          echo "ELF header"
+          echo "========================================"
 
-          if readelf -l artifact/nanddump-aarch64-static \
-            | grep -q 'Requesting program interpreter'; then
+          readelf -h "$BIN"
 
-              echo "ERROR: dynamic ELF interpreter detected!"
+          echo
+          echo "========================================"
+          echo "Program headers"
+          echo "========================================"
+
+          readelf -l "$BIN"
+
+          echo
+          echo "========================================"
+          echo "Dynamic section"
+          echo "========================================"
+
+          readelf -d "$BIN" || true
+
+          echo
+          echo "========================================"
+          echo "Architecture verification"
+          echo "========================================"
+
+          file "$BIN" | grep -q "ELF 64-bit"
+          file "$BIN" | grep -q "ARM aarch64"
+
+          echo "Architecture: PASS"
+
+          echo
+          echo "========================================"
+          echo "PT_INTERP verification"
+          echo "========================================"
+
+          if readelf -l "$BIN" \
+            | grep -q "Requesting program interpreter"; then
+
+              echo "ERROR:"
+              echo "nanddump contains an ELF interpreter."
+              echo "This binary is not fully self-contained."
+
               exit 1
           fi
 
-          echo "No ELF interpreter."
+          echo "PT_INTERP: NONE"
 
           echo
-          echo "===== Dynamic section ====="
+          echo "========================================"
+          echo "DT_NEEDED verification"
+          echo "========================================"
 
-          if readelf -d artifact/nanddump-aarch64-static \
-            2>&1 | grep -q '(NEEDED)'; then
+          if readelf -d "$BIN" 2>/dev/null \
+            | grep -q "(NEEDED)"; then
 
-              echo "ERROR: shared-library dependency detected!"
-              readelf -d artifact/nanddump-aarch64-static
+              echo "ERROR:"
+              echo "nanddump contains shared-library dependencies."
+
+              readelf -d "$BIN"
+
               exit 1
           fi
 
-          echo "No DT_NEEDED entries."
+          echo "DT_NEEDED: NONE"
 
           echo
-          echo "===== Final static check ====="
+          echo "========================================"
+          echo "RESULT"
+          echo "========================================"
 
-          file artifact/nanddump-aarch64-static \
-            | grep -q 'ARM aarch64'
+          echo "PASS: nanddump is a self-contained AArch64 ELF"
 
-          file artifact/nanddump-aarch64-static \
-            | grep -q 'statically linked'
-
-          echo "PASS: static AArch64 binary"
-
-      - name: Show checksum
+      # ------------------------------------------------------------
+      # 10. Save some useful information with the binary
+      # ------------------------------------------------------------
+      - name: Generate build information
         run: |
+          set -eux
+
+          BIN="artifact/nanddump-aarch64-static"
+
+          {
+            echo "nanddump static AArch64 build"
+            echo
+            echo "===== mtd-utils commit ====="
+            cat MTD_UTILS_COMMIT.txt
+            echo
+            echo "===== compiler ====="
+            aarch64-linux-musl-gcc --version
+            echo
+            echo "===== file ====="
+            file "$BIN"
+            echo
+            echo "===== SHA256 ====="
+            cat artifact/nanddump-aarch64-static.sha256
+            echo
+            echo "===== ELF header ====="
+            readelf -h "$BIN"
+            echo
+            echo "===== Dynamic section ====="
+            readelf -d "$BIN" 2>&1 || true
+          } > artifact/BUILD-INFO.txt
+
+      # ------------------------------------------------------------
+      # 11. Display final result in Actions log
+      # ------------------------------------------------------------
+      - name: Show final artifact
+        run: |
+          set -eux
+
+          ls -lh artifact/
+
+          echo
           cat artifact/nanddump-aarch64-static.sha256
 
-      - name: Upload artifact
+          echo
+          file artifact/nanddump-aarch64-static
+
+      # ------------------------------------------------------------
+      # 12. Upload
+      # ------------------------------------------------------------
+      - name: Upload nanddump artifact
         uses: actions/upload-artifact@v4
         with:
           name: nanddump-aarch64-static
